@@ -12,6 +12,7 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildMessages,
   ],
 });
 
@@ -21,6 +22,19 @@ const protectedUserIds = new Set(
     .map((id) => id.trim())
     .filter(Boolean)
 );
+
+const randomReplies = [
+  "What do you want?",
+  "You rang?",
+  "I have been summoned.",
+  "Behave yourself.",
+  "Someone getting disconnected again?",
+  "I am watching the voice channels 👀",
+  "Do not make me disconnect you.",
+  "Leave me alone.",
+  "Hello there.",
+  "Beep boop.",
+];
 
 // Prevent the same audit-log action being handled more than once.
 const processedAuditActions = new Set();
@@ -37,6 +51,7 @@ if (protectedUserIds.size === 0) {
 
 client.once(Events.ClientReady, (readyClient) => {
   console.log(`Bot logged in as ${readyClient.user.tag}`);
+
   console.log(
     `Protecting ${protectedUserIds.size} user(s): ${[
       ...protectedUserIds,
@@ -44,6 +59,43 @@ client.once(Events.ClientReady, (readyClient) => {
   );
 });
 
+/**
+ * Reply with a random message whenever someone mentions the bot.
+ */
+client.on(Events.MessageCreate, async (message) => {
+  // Ignore all messages sent by bots.
+  if (message.author.bot) {
+    return;
+  }
+
+  // Only respond when this bot is mentioned.
+  if (!message.mentions.users.has(client.user.id)) {
+    return;
+  }
+
+  const randomReply =
+    randomReplies[Math.floor(Math.random() * randomReplies.length)];
+
+  try {
+    await message.reply({
+      content: randomReply,
+      allowedMentions: {
+        // Do not ping the person again when replying.
+        repliedUser: false,
+      },
+    });
+
+    console.log(
+      `Replied to a mention from ${message.author.tag} in ${message.guild?.name || "a direct message"}.`
+    );
+  } catch (error) {
+    console.error("Failed to reply to mention:", error);
+  }
+});
+
+/**
+ * Detect when a protected user is disconnected from voice.
+ */
 client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
   const protectedMember = oldState.member;
 
