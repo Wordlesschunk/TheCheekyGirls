@@ -23,6 +23,10 @@ const protectedUserIds = new Set(
     .filter(Boolean)
 );
 
+const disconnectMessageChannelId = (
+  process.env.DISCONNECT_MESSAGE_CHANNEL_ID || ""
+).trim();
+
 const randomReplies = [
   "Is ryan banging on about his house again?",
   "Does danny need some imodium?",
@@ -46,7 +50,7 @@ const randomReplies = [
   "No Baby",
 ];
 
-// Store the last observed count for each Discord audit-log entry.
+// Stores the most recent count for each Discord disconnect audit entry.
 const disconnectAuditCounts = new Map();
 
 if (!process.env.DISCORD_TOKEN) {
@@ -59,25 +63,21 @@ if (protectedUserIds.size === 0) {
   process.exit(1);
 }
 
-/**
- * Pause execution for a specified amount of time.
- */
+if (!disconnectMessageChannelId) {
+  console.error("Missing DISCONNECT_MESSAGE_CHANNEL_ID in .env");
+  process.exit(1);
+}
+
 function sleep(milliseconds) {
   return new Promise((resolve) => {
     setTimeout(resolve, milliseconds);
   });
 }
 
-/**
- * Create a unique key for an audit-log entry.
- */
 function getDisconnectAuditKey(guildId, entryId) {
   return `${guildId}:${entryId}`;
 }
 
-/**
- * Get the disconnect count from an audit-log entry.
- */
 function getDisconnectCount(entry) {
   const count = Number(entry.extra?.count ?? 1);
 
@@ -85,10 +85,10 @@ function getDisconnectCount(entry) {
 }
 
 /**
- * Load the current audit-log state when the bot starts.
+ * Save the current disconnect audit-log state.
  *
- * This prevents an old audit-log entry from being mistaken
- * for a new disconnect.
+ * This prevents old audit entries from being mistaken for new actions
+ * when the bot starts.
  */
 async function primeDisconnectAuditLogs(guild) {
   const auditLogs = await guild.fetchAuditLogs({
@@ -98,24 +98,23 @@ async function primeDisconnectAuditLogs(guild) {
 
   for (const entry of auditLogs.entries.values()) {
     const key = getDisconnectAuditKey(guild.id, entry.id);
-    const count = getDisconnectCount(entry);
 
-    disconnectAuditCounts.set(key, count);
+    disconnectAuditCounts.set(key, getDisconnectCount(entry));
   }
 }
 
 /**
- * Look for a new moderator disconnect action.
+ * Quickly check for a new moderator disconnect action.
  *
- * Discord sometimes creates a new audit-log entry, but it can also
- * reuse an existing entry and increase its count.
+ * Discord may either create a new audit entry or increase the count
+ * on an existing entry.
  */
 async function findNewDisconnectAction(guild) {
-  const maximumAttempts = 8;
+  const maximumAttempts = 12;
 
   for (let attempt = 0; attempt < maximumAttempts; attempt += 1) {
-    // Give Discord time to update the audit log.
-    await sleep(attempt === 0 ? 750 : 500);
+    // Check after 150ms, then retry every 200ms.
+    await sleep(attempt === 0 ? 150 : 200);
 
     const auditLogs = await guild.fetchAuditLogs({
       type: AuditLogEvent.MemberDisconnect,
@@ -129,15 +128,15 @@ async function findNewDisconnectAction(guild) {
       const currentCount = getDisconnectCount(entry);
       const previousCount = disconnectAuditCounts.get(key);
 
-      const isBotAction = entry.executorId === client.user.id;
       const hasExecutor = Boolean(entry.executorId);
+      const isBotAction = entry.executorId === client.user.id;
 
       const existingEntryIncreased =
         previousCount !== undefined && currentCount > previousCount;
 
       const isRecentNewEntry =
         previousCount === undefined &&
-        Date.now() - entry.createdTimestamp <= 15_000;
+        Date.now() - entry.createdTimestamp <= 10_000;
 
       if (
         hasExecutor &&
@@ -149,12 +148,11 @@ async function findNewDisconnectAction(guild) {
       }
     }
 
-    // Save the latest counts after checking for changes.
+    // Store all of the latest counts after checking for changes.
     for (const entry of auditLogs.entries.values()) {
       const key = getDisconnectAuditKey(guild.id, entry.id);
-      const currentCount = getDisconnectCount(entry);
 
-      disconnectAuditCounts.set(key, currentCount);
+      disconnectAuditCounts.set(key, getDisconnectCount(entry));
     }
 
     if (detectedEntry) {
@@ -174,6 +172,10 @@ client.once(Events.ClientReady, async (readyClient) => {
     ].join(", ")}`
   );
 
+  console.log(
+    `Disconnect messages will be posted in channel ${disconnectMessageChannelId}.`
+  );
+
   for (const guild of readyClient.guilds.cache.values()) {
     try {
       await primeDisconnectAuditLogs(guild);
@@ -189,7 +191,7 @@ client.once(Events.ClientReady, async (readyClient) => {
 });
 
 /**
- * Load audit-log state if the bot joins another server.
+ * Load the audit-log state if the bot joins another server.
  */
 client.on(Events.GuildCreate, async (guild) => {
   try {
@@ -208,13 +210,11 @@ client.on(Events.GuildCreate, async (guild) => {
  * Reply with a random message whenever someone mentions the bot.
  */
 client.on(Events.MessageCreate, async (message) => {
-  // Ignore messages sent by bots.
   if (message.author.bot) {
     return;
   }
 
-  // Only respond when this bot is mentioned.
-  if (!message.mentions.users.has(client.user.id)) {
+  if (!client.user || !message.mentions.users.has(client.user.id)) {
     return;
   }
 
@@ -225,7 +225,6 @@ client.on(Events.MessageCreate, async (message) => {
     await message.reply({
       content: randomReply,
       allowedMentions: {
-        // Do not ping the person again when replying.
         repliedUser: false,
       },
     });
@@ -250,18 +249,17 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
     return;
   }
 
-  // Only monitor users listed in PROTECTED_USER_IDS.
+  // Only monitor protected users.
   if (!protectedUserIds.has(protectedMember.id)) {
     return;
   }
 
-  // The user must previously have been in a voice channel.
+  // The protected user must previously have been in voice.
   if (!oldState.channelId) {
     return;
   }
 
-  // Ignore moves between channels.
-  // Only continue when the user has left voice completely.
+  // Ignore moves between voice channels.
   if (newState.channelId) {
     return;
   }
@@ -299,6 +297,11 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
       return;
     }
 
+    if (!disconnectEntry.executorId) {
+      console.log("The disconnect audit entry did not contain an executor.");
+      return;
+    }
+
     const responsibleMember = await guild.members
       .fetch(disconnectEntry.executorId)
       .catch(() => null);
@@ -324,6 +327,34 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
     console.log(
       `Disconnected ${responsibleMember.user.tag} because they disconnected ${protectedMember.user.tag}.`
     );
+
+    // Fetch the chosen text channel and post the message there.
+    try {
+      const messageChannel = await guild.channels
+        .fetch(disconnectMessageChannelId)
+        .catch(() => null);
+
+      if (!messageChannel || !messageChannel.isSendable()) {
+        console.error(
+          `Channel ${disconnectMessageChannelId} was not found or cannot receive messages.`
+        );
+        return;
+      }
+
+      await messageChannel.send({
+        content: `Oh, **${responsibleMember.displayName}**… you really thought you could disconnect **${protectedMember.displayName}** in front of me? Cute. I’ve personally shown you the door. 💅🚪`,
+        allowedMentions: {
+          parse: [],
+        },
+      });
+
+      console.log(`Posted a message in #${messageChannel.name}.`);
+    } catch (messageError) {
+      console.error(
+        "Failed to post the disconnect message:",
+        messageError
+      );
+    }
   } catch (error) {
     console.error("Failed to process the voice disconnect:", error);
   }
