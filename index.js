@@ -24,16 +24,27 @@ const protectedUserIds = new Set(
 );
 
 const randomReplies = [
-  "What do you want?",
-  "You rang?",
-  "I have been summoned.",
-  "Behave yourself.",
+  "Is ryan banging on about his house again?",
+  "Does danny need some imodium?",
+  "Has luke killed another old man yet?",
+  "Whens Jack getting his hair transplant?",
   "Someone getting disconnected again?",
   "I am watching the voice channels 👀",
-  "Do not make me disconnect you.",
-  "Leave me alone.",
-  "Hello there.",
-  "Beep boop.",
+  "Danny stood in dog shit again?",
+  "Is big jim still playing league?",
+  "Wes fell off his ped?",
+  "Dylan having another maccies?",
+  "IM BORED!!",
+  "Thats not very merry christmas of you",
+  "Is he awping mid?",
+  "Clear comms",
+  "Ugga Dugga",
+  "Baldy Baldy",
+  "DDDDYYYLLLLLOOOONNNN",
+  "Dont do it baby",
+  "Has dyl been using the makeup bin again?",
+  "No Baby",
+  "Curtis is gay, even i know that",
 ];
 
 // Prevent the same audit-log action being handled more than once.
