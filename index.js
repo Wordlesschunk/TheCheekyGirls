@@ -44,11 +44,10 @@ const randomReplies = [
   "Dont do it baby",
   "Has dyl been using the makeup bin again?",
   "No Baby",
-  "Curtis is gay, even i know that",
 ];
 
-// Prevent the same audit-log action being handled more than once.
-const processedAuditActions = new Set();
+// Store the last observed count for each Discord audit-log entry.
+const disconnectAuditCounts = new Map();
 
 if (!process.env.DISCORD_TOKEN) {
   console.error("Missing DISCORD_TOKEN in .env");
@@ -60,7 +59,113 @@ if (protectedUserIds.size === 0) {
   process.exit(1);
 }
 
-client.once(Events.ClientReady, (readyClient) => {
+/**
+ * Pause execution for a specified amount of time.
+ */
+function sleep(milliseconds) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, milliseconds);
+  });
+}
+
+/**
+ * Create a unique key for an audit-log entry.
+ */
+function getDisconnectAuditKey(guildId, entryId) {
+  return `${guildId}:${entryId}`;
+}
+
+/**
+ * Get the disconnect count from an audit-log entry.
+ */
+function getDisconnectCount(entry) {
+  const count = Number(entry.extra?.count ?? 1);
+
+  return Number.isFinite(count) ? count : 1;
+}
+
+/**
+ * Load the current audit-log state when the bot starts.
+ *
+ * This prevents an old audit-log entry from being mistaken
+ * for a new disconnect.
+ */
+async function primeDisconnectAuditLogs(guild) {
+  const auditLogs = await guild.fetchAuditLogs({
+    type: AuditLogEvent.MemberDisconnect,
+    limit: 10,
+  });
+
+  for (const entry of auditLogs.entries.values()) {
+    const key = getDisconnectAuditKey(guild.id, entry.id);
+    const count = getDisconnectCount(entry);
+
+    disconnectAuditCounts.set(key, count);
+  }
+}
+
+/**
+ * Look for a new moderator disconnect action.
+ *
+ * Discord sometimes creates a new audit-log entry, but it can also
+ * reuse an existing entry and increase its count.
+ */
+async function findNewDisconnectAction(guild) {
+  const maximumAttempts = 8;
+
+  for (let attempt = 0; attempt < maximumAttempts; attempt += 1) {
+    // Give Discord time to update the audit log.
+    await sleep(attempt === 0 ? 750 : 500);
+
+    const auditLogs = await guild.fetchAuditLogs({
+      type: AuditLogEvent.MemberDisconnect,
+      limit: 10,
+    });
+
+    let detectedEntry = null;
+
+    for (const entry of auditLogs.entries.values()) {
+      const key = getDisconnectAuditKey(guild.id, entry.id);
+      const currentCount = getDisconnectCount(entry);
+      const previousCount = disconnectAuditCounts.get(key);
+
+      const isBotAction = entry.executorId === client.user.id;
+      const hasExecutor = Boolean(entry.executorId);
+
+      const existingEntryIncreased =
+        previousCount !== undefined && currentCount > previousCount;
+
+      const isRecentNewEntry =
+        previousCount === undefined &&
+        Date.now() - entry.createdTimestamp <= 15_000;
+
+      if (
+        hasExecutor &&
+        !isBotAction &&
+        (existingEntryIncreased || isRecentNewEntry)
+      ) {
+        detectedEntry = entry;
+        break;
+      }
+    }
+
+    // Save the latest counts after checking for changes.
+    for (const entry of auditLogs.entries.values()) {
+      const key = getDisconnectAuditKey(guild.id, entry.id);
+      const currentCount = getDisconnectCount(entry);
+
+      disconnectAuditCounts.set(key, currentCount);
+    }
+
+    if (detectedEntry) {
+      return detectedEntry;
+    }
+  }
+
+  return null;
+}
+
+client.once(Events.ClientReady, async (readyClient) => {
   console.log(`Bot logged in as ${readyClient.user.tag}`);
 
   console.log(
@@ -68,13 +173,42 @@ client.once(Events.ClientReady, (readyClient) => {
       ...protectedUserIds,
     ].join(", ")}`
   );
+
+  for (const guild of readyClient.guilds.cache.values()) {
+    try {
+      await primeDisconnectAuditLogs(guild);
+
+      console.log(`Loaded disconnect audit state for ${guild.name}.`);
+    } catch (error) {
+      console.error(
+        `Could not load disconnect audit state for ${guild.name}:`,
+        error
+      );
+    }
+  }
+});
+
+/**
+ * Load audit-log state if the bot joins another server.
+ */
+client.on(Events.GuildCreate, async (guild) => {
+  try {
+    await primeDisconnectAuditLogs(guild);
+
+    console.log(`Loaded disconnect audit state for ${guild.name}.`);
+  } catch (error) {
+    console.error(
+      `Could not load disconnect audit state for ${guild.name}:`,
+      error
+    );
+  }
 });
 
 /**
  * Reply with a random message whenever someone mentions the bot.
  */
 client.on(Events.MessageCreate, async (message) => {
-  // Ignore all messages sent by bots.
+  // Ignore messages sent by bots.
   if (message.author.bot) {
     return;
   }
@@ -97,7 +231,9 @@ client.on(Events.MessageCreate, async (message) => {
     });
 
     console.log(
-      `Replied to a mention from ${message.author.tag} in ${message.guild?.name || "a direct message"}.`
+      `Replied to a mention from ${message.author.tag} in ${
+        message.guild?.name || "a direct message"
+      }.`
     );
   } catch (error) {
     console.error("Failed to reply to mention:", error);
@@ -105,7 +241,7 @@ client.on(Events.MessageCreate, async (message) => {
 });
 
 /**
- * Detect when a protected user is disconnected from voice.
+ * Detect when a protected user leaves or is disconnected from voice.
  */
 client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
   const protectedMember = oldState.member;
@@ -114,23 +250,23 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
     return;
   }
 
-  // Only listen for users in the protected list.
+  // Only monitor users listed in PROTECTED_USER_IDS.
   if (!protectedUserIds.has(protectedMember.id)) {
     return;
   }
 
-  // They must have previously been in voice.
+  // The user must previously have been in a voice channel.
   if (!oldState.channelId) {
     return;
   }
 
-  // Ignore channel moves. Only detect leaving voice completely.
+  // Ignore moves between channels.
+  // Only continue when the user has left voice completely.
   if (newState.channelId) {
     return;
   }
 
   const guild = oldState.guild;
-  const disconnectTime = Date.now();
 
   console.log(
     `${protectedMember.user.tag} left or was disconnected from voice.`
@@ -154,77 +290,42 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
       return;
     }
 
-    // Give Discord time to create the audit-log entry.
-    setTimeout(async () => {
-      try {
-        const auditLogs = await guild.fetchAuditLogs({
-          type: AuditLogEvent.MemberDisconnect,
-          limit: 5,
-        });
+    const disconnectEntry = await findNewDisconnectAction(guild);
 
-        const disconnectEntry = auditLogs.entries.find((entry) => {
-          if (!entry.executorId) {
-            return false;
-          }
+    if (!disconnectEntry) {
+      console.log(
+        `${protectedMember.user.tag} probably left voice themselves.`
+      );
+      return;
+    }
 
-          // Never react to the bot's own actions.
-          if (entry.executorId === client.user.id) {
-            return false;
-          }
+    const responsibleMember = await guild.members
+      .fetch(disconnectEntry.executorId)
+      .catch(() => null);
 
-          const entryAge = disconnectTime - entry.createdTimestamp;
+    if (!responsibleMember) {
+      console.log(
+        `Could not find the user responsible for disconnecting ${protectedMember.user.tag}.`
+      );
+      return;
+    }
 
-          // Audit entry must have appeared around the voice disconnect.
-          return entryAge >= -3000 && entryAge <= 7000;
-        });
+    if (!responsibleMember.voice.channelId) {
+      console.log(
+        `${responsibleMember.user.tag} disconnected ${protectedMember.user.tag}, but they are no longer in voice.`
+      );
+      return;
+    }
 
-        if (!disconnectEntry) {
-          console.log(
-            `${protectedMember.user.tag} probably left voice themselves.`
-          );
-          return;
-        }
+    await responsibleMember.voice.disconnect(
+      `Automatically disconnected for disconnecting protected user ${protectedMember.user.tag}`
+    );
 
-        const actionCount = disconnectEntry.extra?.count || 1;
-        const actionKey = `${disconnectEntry.id}:${actionCount}`;
-
-        if (processedAuditActions.has(actionKey)) {
-          return;
-        }
-
-        processedAuditActions.add(actionKey);
-
-        const responsibleMember = await guild.members
-          .fetch(disconnectEntry.executorId)
-          .catch(() => null);
-
-        if (!responsibleMember) {
-          console.log(
-            `Could not find the user responsible for disconnecting ${protectedMember.user.tag}.`
-          );
-          return;
-        }
-
-        if (!responsibleMember.voice.channelId) {
-          console.log(
-            `${responsibleMember.user.tag} disconnected ${protectedMember.user.tag}, but they are no longer in voice.`
-          );
-          return;
-        }
-
-        await responsibleMember.voice.disconnect(
-          `Automatically disconnected for disconnecting protected user ${protectedMember.user.tag}`
-        );
-
-        console.log(
-          `Disconnected ${responsibleMember.user.tag} because they disconnected protected user ${protectedMember.user.tag}.`
-        );
-      } catch (error) {
-        console.error("Failed to process the disconnect:", error);
-      }
-    }, 1500);
+    console.log(
+      `Disconnected ${responsibleMember.user.tag} because they disconnected ${protectedMember.user.tag}.`
+    );
   } catch (error) {
-    console.error("Voice-state handler failed:", error);
+    console.error("Failed to process the voice disconnect:", error);
   }
 });
 
