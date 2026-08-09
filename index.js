@@ -27,6 +27,10 @@ const disconnectMessageChannelId = (
   process.env.DISCONNECT_MESSAGE_CHANNEL_ID || ""
 ).trim();
 
+const idiotCornerChannelId = (
+  process.env.IDIOT_CORNER_CHANNEL_ID || ""
+).trim();
+
 const randomReplies = [
   "Is ryan banging on about his house again?",
   "Does danny need some imodium?",
@@ -50,8 +54,9 @@ const randomReplies = [
   "No Baby",
 ];
 
-// Stores the most recent count for each Discord disconnect audit entry.
+// Stores the latest count for Discord audit entries.
 const disconnectAuditCounts = new Map();
+const moveAuditCounts = new Map();
 
 if (!process.env.DISCORD_TOKEN) {
   console.error("Missing DISCORD_TOKEN in .env");
@@ -68,26 +73,41 @@ if (!disconnectMessageChannelId) {
   process.exit(1);
 }
 
+if (!idiotCornerChannelId) {
+  console.error("Missing IDIOT_CORNER_CHANNEL_ID in .env");
+  process.exit(1);
+}
+
 function sleep(milliseconds) {
   return new Promise((resolve) => {
     setTimeout(resolve, milliseconds);
   });
 }
 
-function getDisconnectAuditKey(guildId, entryId) {
+function getAuditKey(guildId, entryId) {
   return `${guildId}:${entryId}`;
 }
 
-function getDisconnectCount(entry) {
+function getAuditCount(entry) {
   const count = Number(entry.extra?.count ?? 1);
 
   return Number.isFinite(count) ? count : 1;
 }
 
 /**
- * Save the current disconnect audit-log state.
- *
- * This prevents old audit entries from being mistaken for new actions
+ * Discord.js normally exposes the channel in entry.extra.channel
+ * for MEMBER_MOVE audit entries.
+ */
+function getMoveDestinationChannelId(entry) {
+  return (
+    entry.extra?.channel?.id ??
+    entry.extra?.channelId ??
+    null
+  );
+}
+
+/**
+ * Prime disconnect audit logs so old actions aren't processed
  * when the bot starts.
  */
 async function primeDisconnectAuditLogs(guild) {
@@ -97,23 +117,36 @@ async function primeDisconnectAuditLogs(guild) {
   });
 
   for (const entry of auditLogs.entries.values()) {
-    const key = getDisconnectAuditKey(guild.id, entry.id);
+    const key = getAuditKey(guild.id, entry.id);
 
-    disconnectAuditCounts.set(key, getDisconnectCount(entry));
+    disconnectAuditCounts.set(key, getAuditCount(entry));
   }
 }
 
 /**
- * Quickly check for a new moderator disconnect action.
- *
- * Discord may either create a new audit entry or increase the count
- * on an existing entry.
+ * Prime move audit logs so old moves aren't processed
+ * when the bot starts.
+ */
+async function primeMoveAuditLogs(guild) {
+  const auditLogs = await guild.fetchAuditLogs({
+    type: AuditLogEvent.MemberMove,
+    limit: 10,
+  });
+
+  for (const entry of auditLogs.entries.values()) {
+    const key = getAuditKey(guild.id, entry.id);
+
+    moveAuditCounts.set(key, getAuditCount(entry));
+  }
+}
+
+/**
+ * Find a new moderator disconnect action.
  */
 async function findNewDisconnectAction(guild) {
   const maximumAttempts = 12;
 
   for (let attempt = 0; attempt < maximumAttempts; attempt += 1) {
-    // Check after 150ms, then retry every 200ms.
     await sleep(attempt === 0 ? 150 : 200);
 
     const auditLogs = await guild.fetchAuditLogs({
@@ -124,15 +157,16 @@ async function findNewDisconnectAction(guild) {
     let detectedEntry = null;
 
     for (const entry of auditLogs.entries.values()) {
-      const key = getDisconnectAuditKey(guild.id, entry.id);
-      const currentCount = getDisconnectCount(entry);
+      const key = getAuditKey(guild.id, entry.id);
+      const currentCount = getAuditCount(entry);
       const previousCount = disconnectAuditCounts.get(key);
 
       const hasExecutor = Boolean(entry.executorId);
       const isBotAction = entry.executorId === client.user.id;
 
       const existingEntryIncreased =
-        previousCount !== undefined && currentCount > previousCount;
+        previousCount !== undefined &&
+        currentCount > previousCount;
 
       const isRecentNewEntry =
         previousCount === undefined &&
@@ -148,11 +182,10 @@ async function findNewDisconnectAction(guild) {
       }
     }
 
-    // Store all of the latest counts after checking for changes.
     for (const entry of auditLogs.entries.values()) {
-      const key = getDisconnectAuditKey(guild.id, entry.id);
+      const key = getAuditKey(guild.id, entry.id);
 
-      disconnectAuditCounts.set(key, getDisconnectCount(entry));
+      disconnectAuditCounts.set(key, getAuditCount(entry));
     }
 
     if (detectedEntry) {
@@ -161,6 +194,103 @@ async function findNewDisconnectAction(guild) {
   }
 
   return null;
+}
+
+/**
+ * Find a new moderator move action.
+ *
+ * We also check the destination channel to reduce the chance
+ * of matching an unrelated move.
+ */
+async function findNewMoveAction(guild, destinationChannelId) {
+  const maximumAttempts = 12;
+
+  for (let attempt = 0; attempt < maximumAttempts; attempt += 1) {
+    await sleep(attempt === 0 ? 150 : 200);
+
+    const auditLogs = await guild.fetchAuditLogs({
+      type: AuditLogEvent.MemberMove,
+      limit: 10,
+    });
+
+    let detectedEntry = null;
+
+    for (const entry of auditLogs.entries.values()) {
+      const key = getAuditKey(guild.id, entry.id);
+      const currentCount = getAuditCount(entry);
+      const previousCount = moveAuditCounts.get(key);
+
+      const hasExecutor = Boolean(entry.executorId);
+      const isBotAction = entry.executorId === client.user.id;
+
+      const existingEntryIncreased =
+        previousCount !== undefined &&
+        currentCount > previousCount;
+
+      const isRecentNewEntry =
+        previousCount === undefined &&
+        Date.now() - entry.createdTimestamp <= 10_000;
+
+      const auditDestinationChannelId =
+        getMoveDestinationChannelId(entry);
+
+      const destinationMatches =
+        !auditDestinationChannelId ||
+        auditDestinationChannelId === destinationChannelId;
+
+      if (
+        hasExecutor &&
+        !isBotAction &&
+        destinationMatches &&
+        (existingEntryIncreased || isRecentNewEntry)
+      ) {
+        detectedEntry = entry;
+        break;
+      }
+    }
+
+    // Update our stored counts.
+    for (const entry of auditLogs.entries.values()) {
+      const key = getAuditKey(guild.id, entry.id);
+
+      moveAuditCounts.set(key, getAuditCount(entry));
+    }
+
+    if (detectedEntry) {
+      return detectedEntry;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Send a message into the configured text channel.
+ */
+async function sendProtectionMessage(guild, content) {
+  try {
+    const messageChannel = await guild.channels
+      .fetch(disconnectMessageChannelId)
+      .catch(() => null);
+
+    if (!messageChannel || !messageChannel.isSendable()) {
+      console.error(
+        `Channel ${disconnectMessageChannelId} was not found or cannot receive messages.`
+      );
+      return;
+    }
+
+    await messageChannel.send({
+      content,
+      allowedMentions: {
+        parse: [],
+      },
+    });
+
+    console.log(`Posted a message in #${messageChannel.name}.`);
+  } catch (error) {
+    console.error("Failed to post protection message:", error);
+  }
 }
 
 client.once(Events.ClientReady, async (readyClient) => {
@@ -173,17 +303,26 @@ client.once(Events.ClientReady, async (readyClient) => {
   );
 
   console.log(
-    `Disconnect messages will be posted in channel ${disconnectMessageChannelId}.`
+    `Protection messages will be posted in channel ${disconnectMessageChannelId}.`
+  );
+
+  console.log(
+    `Idiot corner voice channel: ${idiotCornerChannelId}.`
   );
 
   for (const guild of readyClient.guilds.cache.values()) {
     try {
-      await primeDisconnectAuditLogs(guild);
+      await Promise.all([
+        primeDisconnectAuditLogs(guild),
+        primeMoveAuditLogs(guild),
+      ]);
 
-      console.log(`Loaded disconnect audit state for ${guild.name}.`);
+      console.log(
+        `Loaded disconnect and move audit state for ${guild.name}.`
+      );
     } catch (error) {
       console.error(
-        `Could not load disconnect audit state for ${guild.name}:`,
+        `Could not load audit state for ${guild.name}:`,
         error
       );
     }
@@ -191,16 +330,21 @@ client.once(Events.ClientReady, async (readyClient) => {
 });
 
 /**
- * Load the audit-log state if the bot joins another server.
+ * Load audit state if the bot joins another server.
  */
 client.on(Events.GuildCreate, async (guild) => {
   try {
-    await primeDisconnectAuditLogs(guild);
+    await Promise.all([
+      primeDisconnectAuditLogs(guild),
+      primeMoveAuditLogs(guild),
+    ]);
 
-    console.log(`Loaded disconnect audit state for ${guild.name}.`);
+    console.log(
+      `Loaded disconnect and move audit state for ${guild.name}.`
+    );
   } catch (error) {
     console.error(
-      `Could not load disconnect audit state for ${guild.name}:`,
+      `Could not load audit state for ${guild.name}:`,
       error
     );
   }
@@ -240,7 +384,7 @@ client.on(Events.MessageCreate, async (message) => {
 });
 
 /**
- * Detect when a protected user leaves or is disconnected from voice.
+ * Protect users from forced disconnects AND forced moves.
  */
 client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
   const protectedMember = oldState.member;
@@ -254,21 +398,17 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
     return;
   }
 
-  // The protected user must previously have been in voice.
+  // They must already have been in voice.
   if (!oldState.channelId) {
     return;
   }
 
-  // Ignore moves between voice channels.
-  if (newState.channelId) {
+  // Nothing relevant changed.
+  if (oldState.channelId === newState.channelId) {
     return;
   }
 
   const guild = oldState.guild;
-
-  console.log(
-    `${protectedMember.user.tag} left or was disconnected from voice.`
-  );
 
   try {
     const botMember = await guild.members.fetchMe();
@@ -288,75 +428,157 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
       return;
     }
 
-    const disconnectEntry = await findNewDisconnectAction(guild);
-
-    if (!disconnectEntry) {
+    /*
+     * =========================================================
+     * PROTECTED USER WAS DISCONNECTED
+     * =========================================================
+     */
+    if (!newState.channelId) {
       console.log(
-        `${protectedMember.user.tag} probably left voice themselves.`
+        `${protectedMember.user.tag} left or was disconnected from voice.`
       );
-      return;
-    }
 
-    if (!disconnectEntry.executorId) {
-      console.log("The disconnect audit entry did not contain an executor.");
-      return;
-    }
+      const disconnectEntry =
+        await findNewDisconnectAction(guild);
 
-    const responsibleMember = await guild.members
-      .fetch(disconnectEntry.executorId)
-      .catch(() => null);
-
-    if (!responsibleMember) {
-      console.log(
-        `Could not find the user responsible for disconnecting ${protectedMember.user.tag}.`
-      );
-      return;
-    }
-
-    if (!responsibleMember.voice.channelId) {
-      console.log(
-        `${responsibleMember.user.tag} disconnected ${protectedMember.user.tag}, but they are no longer in voice.`
-      );
-      return;
-    }
-
-    await responsibleMember.voice.disconnect(
-      `Automatically disconnected for disconnecting protected user ${protectedMember.user.tag}`
-    );
-
-    console.log(
-      `Disconnected ${responsibleMember.user.tag} because they disconnected ${protectedMember.user.tag}.`
-    );
-
-    // Fetch the chosen text channel and post the message there.
-    try {
-      const messageChannel = await guild.channels
-        .fetch(disconnectMessageChannelId)
-        .catch(() => null);
-
-      if (!messageChannel || !messageChannel.isSendable()) {
-        console.error(
-          `Channel ${disconnectMessageChannelId} was not found or cannot receive messages.`
+      if (!disconnectEntry) {
+        console.log(
+          `${protectedMember.user.tag} probably left voice themselves.`
         );
         return;
       }
 
-      await messageChannel.send({
-        content: `Oh, **${responsibleMember.displayName}**… you really thought you could disconnect **${protectedMember.displayName}** in front of me? Cute. I’ve personally shown you the door. 💅🚪`,
-        allowedMentions: {
-          parse: [],
-        },
-      });
+      if (!disconnectEntry.executorId) {
+        return;
+      }
 
-      console.log(`Posted a message in #${messageChannel.name}.`);
-    } catch (messageError) {
-      console.error(
-        "Failed to post the disconnect message:",
-        messageError
+      const responsibleMember = await guild.members
+        .fetch(disconnectEntry.executorId)
+        .catch(() => null);
+
+      if (!responsibleMember) {
+        console.log(
+          `Could not find who disconnected ${protectedMember.user.tag}.`
+        );
+        return;
+      }
+
+      if (!responsibleMember.voice.channelId) {
+        console.log(
+          `${responsibleMember.user.tag} disconnected ${protectedMember.user.tag}, but they are no longer in voice.`
+        );
+        return;
+      }
+
+      await responsibleMember.voice.disconnect(
+        `Automatically disconnected for disconnecting protected user ${protectedMember.user.tag}`
       );
+
+      console.log(
+        `Disconnected ${responsibleMember.user.tag} because they disconnected ${protectedMember.user.tag}.`
+      );
+
+      await sendProtectionMessage(
+        guild,
+        `Oh, **${responsibleMember.displayName}**… you really thought you could disconnect **${protectedMember.displayName}** in front of me? Cute. I’ve personally shown you the door. 💅🚪`
+      );
+
+      return;
     }
+
+    /*
+     * =========================================================
+     * PROTECTED USER WAS MOVED
+     * =========================================================
+     */
+    console.log(
+      `${protectedMember.user.tag} moved from ${oldState.channelId} to ${newState.channelId}.`
+    );
+
+    const moveEntry = await findNewMoveAction(
+      guild,
+      newState.channelId
+    );
+
+    if (!moveEntry) {
+      console.log(
+        `${protectedMember.user.tag} probably moved themselves.`
+      );
+      return;
+    }
+
+    if (!moveEntry.executorId) {
+      console.log(
+        "Move audit entry did not contain an executor."
+      );
+      return;
+    }
+
+    const responsibleMember = await guild.members
+      .fetch(moveEntry.executorId)
+      .catch(() => null);
+
+    if (!responsibleMember) {
+      console.log(
+        `Could not find who moved ${protectedMember.user.tag}.`
+      );
+      return;
+    }
+
+    console.log(
+      `${responsibleMember.user.tag} moved ${protectedMember.user.tag}.`
+    );
+
+    // They need to still be connected for us to punish them.
+    if (!responsibleMember.voice.channelId) {
+      console.log(
+        `${responsibleMember.user.tag} moved ${protectedMember.user.tag}, but they are no longer in voice.`
+      );
+      return;
+    }
+
+    // Don't bother if they're already in idiot corner.
+    if (
+      responsibleMember.voice.channelId === idiotCornerChannelId
+    ) {
+      console.log(
+        `${responsibleMember.user.tag} is already in idiot corner.`
+      );
+      return;
+    }
+
+    const idiotCornerChannel = await guild.channels
+      .fetch(idiotCornerChannelId)
+      .catch(() => null);
+
+    if (
+      !idiotCornerChannel ||
+      !idiotCornerChannel.isVoiceBased()
+    ) {
+      console.error(
+        `Idiot corner channel ${idiotCornerChannelId} does not exist or is not a voice channel.`
+      );
+      return;
+    }
+
+    await responsibleMember.voice.setChannel(
+      idiotCornerChannel,
+      `Moved to idiot corner for moving protected user ${protectedMember.user.tag}`
+    );
+
+    console.log(
+      `Moved ${responsibleMember.user.tag} to idiot corner because they moved ${protectedMember.user.tag}.`
+    );
+
+    await sendProtectionMessage(
+      guild,
+      `🚨 **${responsibleMember.displayName}** moved **${protectedMember.displayName}** without permission. Enjoy the idiot corner. 🫵😂`
+    );
   } catch (error) {
-    console.error("Failed to process the voice disconnect:", error);
+    console.error(
+      "Failed to process protected voice action:",
+      error
+    );
   }
 });
 
